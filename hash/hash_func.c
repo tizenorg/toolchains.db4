@@ -1,13 +1,4 @@
 /*-
- * See the file LICENSE for redistribution information.
- *
- * Copyright (c) 1996-2009 Oracle.  All rights reserved.
- */
-/*
- * Copyright (c) 1990, 1993
- *	Margo Seltzer.  All rights reserved.
- */
-/*
  * Copyright (c) 1990, 1993
  *	The Regents of the University of California.  All rights reserved.
  *
@@ -22,7 +13,11 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. Neither the name of the University nor the names of its contributors
+ * 3. All advertising materials mentioning features or use of this software
+ *    must display the following acknowledgement:
+ *	This product includes software developed by the University of
+ *	California, Berkeley and its contributors.
+ * 4. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -37,204 +32,181 @@
  * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
- *
- * $Id$
  */
 
-#include "db_config.h"
+#if defined(LIBC_SCCS) && !defined(lint)
+static char sccsid[] = "@(#)hash_func.c	8.2 (Berkeley) 2/21/94";
+#endif /* LIBC_SCCS and not lint */
 
-#include "db_int.h"
-#include "dbinc/db_page.h"
-#include "dbinc/hash.h"
+#include <sys/types.h>
+
+#include <db.h>
+#include "hash.h"
+#include "page.h"
+#include "extern.h"
+
+static u_int32_t hash1 __P((const void *, size_t));
+static u_int32_t hash2 __P((const void *, size_t));
+static u_int32_t hash3 __P((const void *, size_t));
+static u_int32_t hash4 __P((const void *, size_t));
+
+/* Global default hash function */
+u_int32_t (*__default_hash) __P((const void *, size_t)) = hash4;
 
 /*
- * __ham_func2 --
- *	Phong Vo's linear congruential hash.
+ * HASH FUNCTIONS
  *
- * PUBLIC: u_int32_t __ham_func2 __P((DB *, const void *, u_int32_t));
+ * Assume that we've already split the bucket to which this key hashes,
+ * calculate that bucket, and check that in fact we did already split it.
+ *
+ * This came from ejb's hsearch.
  */
-#define	DCHARHASH(h, c)	((h) = 0x63c63cd9*(h) + 0x9c39c33d + (c))
 
-u_int32_t
-__ham_func2(dbp, key, len)
-	DB *dbp;
-	const void *key;
-	u_int32_t len;
+#define PRIME1		37
+#define PRIME2		1048583
+
+static u_int32_t
+hash1(keyarg, len)
+	const void *keyarg;
+	register size_t len;
 {
-	const u_int8_t *e, *k;
-	u_int32_t h;
-	u_int8_t c;
+	register const u_char *key;
+	register u_int32_t h;
 
-	if (dbp != NULL)
-		COMPQUIET(dbp, NULL);
+	/* Convert string to integer */
+	for (key = keyarg, h = 0; len--;)
+		h = h * PRIME1 ^ (*key++ - ' ');
+	h %= PRIME2;
+	return (h);
+}
 
-	k = key;
-	e = k + len;
-	for (h = 0; k != e;) {
-		c = *k++;
-		if (!c && k > e)
+/*
+ * Phong's linear congruential hash
+ */
+#define dcharhash(h, c)	((h) = 0x63c63cd9*(h) + 0x9c39c33d + (c))
+
+static u_int32_t
+hash2(keyarg, len)
+	const void *keyarg;
+	size_t len;
+{
+	register const u_char *e, *key;
+	register u_int32_t h;
+	register u_char c;
+
+	key = keyarg;
+	e = key + len;
+	for (h = 0; key != e;) {
+		c = *key++;
+		if (!c && key > e)
 			break;
-		DCHARHASH(h, c);
+		dcharhash(h, c);
 	}
 	return (h);
 }
 
 /*
- * __ham_func3 --
- *	Ozan Yigit's original sdbm hash.
+ * This is INCREDIBLY ugly, but fast.  We break the string up into 8 byte
+ * units.  On the first time through the loop we get the "leftover bytes"
+ * (strlen % 8).  On every other iteration, we perform 8 HASHC's so we handle
+ * all 8 bytes.  Essentially, this saves us 7 cmp & branch instructions.  If
+ * this routine is heavily used enough, it's worth the ugly coding.
  *
- * Ugly, but fast.  Break the string up into 8 byte units.  On the first time
- * through the loop get the "leftover bytes" (strlen % 8).  On every other
- * iteration, perform 8 HASHC's so we handle all 8 bytes.  Essentially, this
- * saves us 7 cmp & branch instructions.
- *
- * PUBLIC: u_int32_t __ham_func3 __P((DB *, const void *, u_int32_t));
+ * OZ's original sdbm hash
  */
-u_int32_t
-__ham_func3(dbp, key, len)
-	DB *dbp;
-	const void *key;
-	u_int32_t len;
+static u_int32_t
+hash3(keyarg, len)
+	const void *keyarg;
+	register size_t len;
 {
-	const u_int8_t *k;
-	u_int32_t n, loop;
+	register const u_char *key;
+	register size_t loop;
+	register u_int32_t h;
 
-	if (dbp != NULL)
-		COMPQUIET(dbp, NULL);
+#define HASHC   h = *key++ + 65599 * h
 
-	if (len == 0)
-		return (0);
-
-#define	HASHC	n = *k++ + 65599 * n
-	n = 0;
-	k = key;
-
-	loop = (len + 8 - 1) >> 3;
-	switch (len & (8 - 1)) {
-	case 0:
-		do {
-			HASHC;
-	case 7:
-			HASHC;
-	case 6:
-			HASHC;
-	case 5:
-			HASHC;
-	case 4:
-			HASHC;
-	case 3:
-			HASHC;
-	case 2:
-			HASHC;
-	case 1:
-			HASHC;
-		} while (--loop);
-	}
-	return (n);
-}
-
-/*
- * __ham_func4 --
- *	Chris Torek's hash function.  Although this function performs only
- *	slightly worse than __ham_func5 on strings, it performs horribly on
- *	numbers.
- *
- * PUBLIC: u_int32_t __ham_func4 __P((DB *, const void *, u_int32_t));
- */
-u_int32_t
-__ham_func4(dbp, key, len)
-	DB *dbp;
-	const void *key;
-	u_int32_t len;
-{
-	const u_int8_t *k;
-	u_int32_t h, loop;
-
-	if (dbp != NULL)
-		COMPQUIET(dbp, NULL);
-
-	if (len == 0)
-		return (0);
-
-#define	HASH4a	h = (h << 5) - h + *k++;
-#define	HASH4b	h = (h << 5) + h + *k++;
-#define	HASH4	HASH4b
 	h = 0;
-	k = key;
+	key = keyarg;
+	if (len > 0) {
+		loop = (len + 8 - 1) >> 3;
 
-	loop = (len + 8 - 1) >> 3;
-	switch (len & (8 - 1)) {
-	case 0:
-		do {
-			HASH4;
-	case 7:
-			HASH4;
-	case 6:
-			HASH4;
-	case 5:
-			HASH4;
-	case 4:
-			HASH4;
-	case 3:
-			HASH4;
-	case 2:
-			HASH4;
-	case 1:
-			HASH4;
-		} while (--loop);
+		switch (len & (8 - 1)) {
+		case 0:
+			do {
+				HASHC;
+				/* FALLTHROUGH */
+		case 7:
+				HASHC;
+				/* FALLTHROUGH */
+		case 6:
+				HASHC;
+				/* FALLTHROUGH */
+		case 5:
+				HASHC;
+				/* FALLTHROUGH */
+		case 4:
+				HASHC;
+				/* FALLTHROUGH */
+		case 3:
+				HASHC;
+				/* FALLTHROUGH */
+		case 2:
+				HASHC;
+				/* FALLTHROUGH */
+		case 1:
+				HASHC;
+			} while (--loop);
+		}
 	}
 	return (h);
 }
 
-/*
- * Fowler/Noll/Vo hash
- *
- * The basis of the hash algorithm was taken from an idea sent by email to the
- * IEEE Posix P1003.2 mailing list from Phong Vo (kpv@research.att.com) and
- * Glenn Fowler (gsf@research.att.com).  Landon Curt Noll (chongo@toad.com)
- * later improved on their algorithm.
- *
- * The magic is in the interesting relationship between the special prime
- * 16777619 (2^24 + 403) and 2^32 and 2^8.
- *
- * This hash produces the fewest collisions of any function that we've seen so
- * far, and works well on both numbers and strings.
- *
- * PUBLIC: u_int32_t __ham_func5 __P((DB *, const void *, u_int32_t));
- */
-u_int32_t
-__ham_func5(dbp, key, len)
-	DB *dbp;
-	const void *key;
-	u_int32_t len;
+/* Hash function from Chris Torek. */
+static u_int32_t
+hash4(keyarg, len)
+	const void *keyarg;
+	register size_t len;
 {
-	const u_int8_t *k, *e;
-	u_int32_t h;
+	register const u_char *key;
+	register size_t loop;
+	register u_int32_t h;
 
-	if (dbp != NULL)
-		COMPQUIET(dbp, NULL);
+#define HASH4a   h = (h << 5) - h + *key++;
+#define HASH4b   h = (h << 5) + h + *key++;
+#define HASH4 HASH4b
 
-	k = key;
-	e = k + len;
-	for (h = 0; k < e; ++k) {
-		h *= 16777619;
-		h ^= *k;
+	h = 0;
+	key = keyarg;
+	if (len > 0) {
+		loop = (len + 8 - 1) >> 3;
+
+		switch (len & (8 - 1)) {
+		case 0:
+			do {
+				HASH4;
+				/* FALLTHROUGH */
+		case 7:
+				HASH4;
+				/* FALLTHROUGH */
+		case 6:
+				HASH4;
+				/* FALLTHROUGH */
+		case 5:
+				HASH4;
+				/* FALLTHROUGH */
+		case 4:
+				HASH4;
+				/* FALLTHROUGH */
+		case 3:
+				HASH4;
+				/* FALLTHROUGH */
+		case 2:
+				HASH4;
+				/* FALLTHROUGH */
+		case 1:
+				HASH4;
+			} while (--loop);
+		}
 	}
 	return (h);
-}
-
-/*
- * __ham_test --
- *
- * PUBLIC: u_int32_t __ham_test __P((DB *, const void *, u_int32_t));
- */
-u_int32_t
-__ham_test(dbp, key, len)
-	DB *dbp;
-	const void *key;
-	u_int32_t len;
-{
-	COMPQUIET(dbp, NULL);
-	COMPQUIET(len, 0);
-	return ((u_int32_t)*(char *)key);
 }

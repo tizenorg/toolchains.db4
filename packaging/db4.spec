@@ -11,13 +11,13 @@ Summary: The Berkeley DB database library (version 4) for C
 Name: db4
 Version: 4.8.30
 Release: 1
-Source0: http://download.oracle.com/berkeley-db/db-%{version}.tar.gz
-Source1: http://download.oracle.com/berkeley-db/db.1.85.tar.gz
+Source0: %{name}-%{version}.tar.bz2
+Source1: db.1.85.tar.gz
 # db-1.85 upstream patches
-Patch10: http://www.oracle.com/technology/products/berkeley-db/db/update/1.85/patch.1.1
-Patch11: http://www.oracle.com/technology/products/berkeley-db/db/update/1.85/patch.1.2
-Patch12: http://www.oracle.com/technology/products/berkeley-db/db/update/1.85/patch.1.3
-Patch13: http://www.oracle.com/technology/products/berkeley-db/db/update/1.85/patch.1.4
+Patch10: patch.1.1
+Patch11: patch.1.2
+Patch12: patch.1.3
+Patch13: patch.1.4
 # other patches
 Patch20: db-1.85-errno.patch
 Patch22: db-4.6.21-1.85-compat.patch
@@ -114,7 +114,7 @@ client/server applications. This package contains the libraries
 for building programs which use the Berkeley DB in Java.
 
 %prep
-%setup -q -n db-%{version} -a 1
+%setup -q -n %{name}-%{version} -a 1
 
 pushd db.1.85/PORT/linux
 %patch10 -p0 -b .1.1
