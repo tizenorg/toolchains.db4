@@ -1,5 +1,14 @@
 /*-
- * Copyright (c) 1990, 1993, 1994
+ * See the file LICENSE for redistribution information.
+ *
+ * Copyright (c) 1996-2009 Oracle.  All rights reserved.
+ */
+/*
+ * Copyright (c) 1990, 1993, 1994, 1995, 1996
+ *	Keith Bostic.  All rights reserved.
+ */
+/*
+ * Copyright (c) 1990, 1993, 1994, 1995
  *	The Regents of the University of California.  All rights reserved.
  *
  * This code is derived from software contributed to Berkeley by
@@ -13,11 +22,7 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
+ * 3. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
  *
@@ -32,626 +37,611 @@
  * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
+ *
+ * $Id$
  */
 
-#if defined(LIBC_SCCS) && !defined(lint)
-static char sccsid[] = "@(#)bt_delete.c	8.13 (Berkeley) 7/28/94";
-#endif /* LIBC_SCCS and not lint */
+#include "db_config.h"
 
-#include <sys/types.h>
-
-#include <errno.h>
-#include <stdio.h>
-#include <string.h>
-
-#include <db.h>
-#include "btree.h"
-
-static int __bt_bdelete __P((BTREE *, const DBT *));
-static int __bt_curdel __P((BTREE *, const DBT *, PAGE *, u_int));
-static int __bt_pdelete __P((BTREE *, PAGE *));
-static int __bt_relink __P((BTREE *, PAGE *));
-static int __bt_stkacq __P((BTREE *, PAGE **, CURSOR *));
+#include "db_int.h"
+#include "dbinc/db_page.h"
+#include "dbinc/btree.h"
+#include "dbinc/lock.h"
+#include "dbinc/mp.h"
 
 /*
- * __bt_delete
- *	Delete the item(s) referenced by a key.
+ * __bam_ditem --
+ *	Delete one or more entries from a page.
  *
- * Return RET_SPECIAL if the key is not found.
+ * PUBLIC: int __bam_ditem __P((DBC *, PAGE *, u_int32_t));
  */
 int
-__bt_delete(dbp, key, flags)
-	const DB *dbp;
-	const DBT *key;
-	u_int flags;
-{
-	BTREE *t;
-	CURSOR *c;
+__bam_ditem(dbc, h, indx)
+	DBC *dbc;
 	PAGE *h;
-	int status;
+	u_int32_t indx;
+{
+	BINTERNAL *bi;
+	BKEYDATA *bk;
+	DB *dbp;
+	u_int32_t nbytes;
+	int ret;
+	db_indx_t *inp;
 
-	t = dbp->internal;
+	dbp = dbc->dbp;
+	inp = P_INP(dbp, h);
 
-	/* Toss any page pinned across calls. */
-	if (t->bt_pinned != NULL) {
-		mpool_put(t->bt_mp, t->bt_pinned, 0);
-		t->bt_pinned = NULL;
-	}
+	/* The page should already have been dirtied by our caller. */
+	DB_ASSERT(dbp->env, IS_DIRTY(h));
 
-	/* Check for change to a read-only tree. */
-	if (F_ISSET(t, B_RDONLY)) {
-		errno = EPERM;
-		return (RET_ERROR);
-	}
-
-	switch (flags) {
-	case 0:
-		status = __bt_bdelete(t, key);
-		break;
-	case R_CURSOR:
-		/*
-		 * If flags is R_CURSOR, delete the cursor.  Must already
-		 * have started a scan and not have already deleted it.
-		 */
-		c = &t->bt_cursor;
-		if (F_ISSET(c, CURS_INIT)) {
-			if (F_ISSET(c, CURS_ACQUIRE | CURS_AFTER | CURS_BEFORE))
-				return (RET_SPECIAL);
-			if ((h = mpool_get(t->bt_mp, c->pg.pgno, 0)) == NULL)
-				return (RET_ERROR);
-
-			/*
-			 * If the page is about to be emptied, we'll need to
-			 * delete it, which means we have to acquire a stack.
-			 */
-			if (NEXTINDEX(h) == 1)
-				if (__bt_stkacq(t, &h, &t->bt_cursor))
-					return (RET_ERROR);
-
-			status = __bt_dleaf(t, NULL, h, c->pg.index);
-
-			if (NEXTINDEX(h) == 0 && status == RET_SUCCESS) {
-				if (__bt_pdelete(t, h))
-					return (RET_ERROR);
-			} else
-				mpool_put(t->bt_mp,
-				    h, status == RET_SUCCESS ? MPOOL_DIRTY : 0);
+	switch (TYPE(h)) {
+	case P_IBTREE:
+		bi = GET_BINTERNAL(dbp, h, indx);
+		switch (B_TYPE(bi->type)) {
+		case B_DUPLICATE:
+		case B_KEYDATA:
+			nbytes = BINTERNAL_SIZE(bi->len);
 			break;
+		case B_OVERFLOW:
+			nbytes = BINTERNAL_SIZE(bi->len);
+			if ((ret =
+			    __db_doff(dbc, ((BOVERFLOW *)bi->data)->pgno)) != 0)
+				return (ret);
+			break;
+		default:
+			return (__db_pgfmt(dbp->env, PGNO(h)));
+		}
+		break;
+	case P_IRECNO:
+		nbytes = RINTERNAL_SIZE;
+		break;
+	case P_LBTREE:
+		/*
+		 * If it's a duplicate key, discard the index and don't touch
+		 * the actual page item.
+		 *
+		 * !!!
+		 * This works because no data item can have an index matching
+		 * any other index so even if the data item is in a key "slot",
+		 * it won't match any other index.
+		 */
+		if ((indx % 2) == 0) {
+			/*
+			 * Check for a duplicate after us on the page.  NOTE:
+			 * we have to delete the key item before deleting the
+			 * data item, otherwise the "indx + P_INDX" calculation
+			 * won't work!
+			 */
+			if (indx + P_INDX < (u_int32_t)NUM_ENT(h) &&
+			    inp[indx] == inp[indx + P_INDX])
+				return (__bam_adjindx(dbc,
+				    h, indx, indx + O_INDX, 0));
+			/*
+			 * Check for a duplicate before us on the page.  It
+			 * doesn't matter if we delete the key item before or
+			 * after the data item for the purposes of this one.
+			 */
+			if (indx > 0 && inp[indx] == inp[indx - P_INDX])
+				return (__bam_adjindx(dbc,
+				    h, indx, indx - P_INDX, 0));
 		}
 		/* FALLTHROUGH */
-	default:
-		errno = EINVAL;
-		return (RET_ERROR);
-	}
-	if (status == RET_SUCCESS)
-		F_SET(t, B_MODIFIED);
-	return (status);
-}
-
-/*
- * __bt_stkacq --
- *	Acquire a stack so we can delete a cursor entry.
- *
- * Parameters:
- *	  t:	tree
- *	 hp:	pointer to current, pinned PAGE pointer
- *	  c:	pointer to the cursor
- *
- * Returns:
- *	0 on success, 1 on failure
- */
-static int
-__bt_stkacq(t, hp, c)
-	BTREE *t;
-	PAGE **hp;
-	CURSOR *c;
-{
-	BINTERNAL *bi;
-	EPG *e;
-	EPGNO *parent;
-	PAGE *h;
-	indx_t index;
-	pgno_t pgno;
-	recno_t nextpg, prevpg;
-	int exact, level;
-	
-	/*
-	 * Find the first occurrence of the key in the tree.  Toss the
-	 * currently locked page so we don't hit an already-locked page.
-	 */
-	h = *hp;
-	mpool_put(t->bt_mp, h, 0);
-	if ((e = __bt_search(t, &c->key, &exact)) == NULL)
-		return (1);
-	h = e->page;
-
-	/* See if we got it in one shot. */
-	if (h->pgno == c->pg.pgno)
-		goto ret;
-
-	/*
-	 * Move right, looking for the page.  At each move we have to move
-	 * up the stack until we don't have to move to the next page.  If
-	 * we have to change pages at an internal level, we have to fix the
-	 * stack back up.
-	 */
-	while (h->pgno != c->pg.pgno) {
-		if ((nextpg = h->nextpg) == P_INVALID)
+	case P_LDUP:
+	case P_LRECNO:
+		bk = GET_BKEYDATA(dbp, h, indx);
+		switch (B_TYPE(bk->type)) {
+		case B_DUPLICATE:
+			nbytes = BOVERFLOW_SIZE;
 			break;
-		mpool_put(t->bt_mp, h, 0);
-
-		/* Move up the stack. */
-		for (level = 0; (parent = BT_POP(t)) != NULL; ++level) {
-			/* Get the parent page. */
-			if ((h = mpool_get(t->bt_mp, parent->pgno, 0)) == NULL)
-				return (1);
-
-			/* Move to the next index. */
-			if (parent->index != NEXTINDEX(h) - 1) {
-				index = parent->index + 1;
-				BT_PUSH(t, h->pgno, index);
-				break;
-			}
-			mpool_put(t->bt_mp, h, 0);
-		}
-
-		/* Restore the stack. */
-		while (level--) {
-			/* Push the next level down onto the stack. */
-			bi = GETBINTERNAL(h, index);
-			pgno = bi->pgno;
-			BT_PUSH(t, pgno, 0);
-
-			/* Lose the currently pinned page. */
-			mpool_put(t->bt_mp, h, 0);
-
-			/* Get the next level down. */
-			if ((h = mpool_get(t->bt_mp, pgno, 0)) == NULL)
-				return (1);
-			index = 0;
-		}
-		mpool_put(t->bt_mp, h, 0);
-		if ((h = mpool_get(t->bt_mp, nextpg, 0)) == NULL)
-			return (1);
-	}
-
-	if (h->pgno == c->pg.pgno)
-		goto ret;
-
-	/* Reacquire the original stack. */
-	mpool_put(t->bt_mp, h, 0);
-	if ((e = __bt_search(t, &c->key, &exact)) == NULL)
-		return (1);
-	h = e->page;
-
-	/*
-	 * Move left, looking for the page.  At each move we have to move
-	 * up the stack until we don't have to change pages to move to the
-	 * next page.  If we have to change pages at an internal level, we
-	 * have to fix the stack back up.
-	 */
-	while (h->pgno != c->pg.pgno) {
-		if ((prevpg = h->prevpg) == P_INVALID)
+		case B_OVERFLOW:
+			nbytes = BOVERFLOW_SIZE;
+			if ((ret = __db_doff(
+			    dbc, (GET_BOVERFLOW(dbp, h, indx))->pgno)) != 0)
+				return (ret);
 			break;
-		mpool_put(t->bt_mp, h, 0);
-
-		/* Move up the stack. */
-		for (level = 0; (parent = BT_POP(t)) != NULL; ++level) {
-			/* Get the parent page. */
-			if ((h = mpool_get(t->bt_mp, parent->pgno, 0)) == NULL)
-				return (1);
-
-			/* Move to the next index. */
-			if (parent->index != 0) {
-				index = parent->index - 1;
-				BT_PUSH(t, h->pgno, index);
-				break;
-			}
-			mpool_put(t->bt_mp, h, 0);
-		}
-
-		/* Restore the stack. */
-		while (level--) {
-			/* Push the next level down onto the stack. */
-			bi = GETBINTERNAL(h, index);
-			pgno = bi->pgno;
-
-			/* Lose the currently pinned page. */
-			mpool_put(t->bt_mp, h, 0);
-
-			/* Get the next level down. */
-			if ((h = mpool_get(t->bt_mp, pgno, 0)) == NULL)
-				return (1);
-
-			index = NEXTINDEX(h) - 1;
-			BT_PUSH(t, pgno, index);
-		}
-		mpool_put(t->bt_mp, h, 0);
-		if ((h = mpool_get(t->bt_mp, prevpg, 0)) == NULL)
-			return (1);
-	}
-	
-
-ret:	mpool_put(t->bt_mp, h, 0);
-	return ((*hp = mpool_get(t->bt_mp, c->pg.pgno, 0)) == NULL);
-}
-
-/*
- * __bt_bdelete --
- *	Delete all key/data pairs matching the specified key.
- *
- * Parameters:
- *	  t:	tree
- *	key:	key to delete
- *
- * Returns:
- *	RET_ERROR, RET_SUCCESS and RET_SPECIAL if the key not found.
- */
-static int
-__bt_bdelete(t, key)
-	BTREE *t;
-	const DBT *key;
-{
-	EPG *e;
-	PAGE *h;
-	int deleted, exact, redo;
-
-	deleted = 0;
-
-	/* Find any matching record; __bt_search pins the page. */
-loop:	if ((e = __bt_search(t, key, &exact)) == NULL)
-		return (deleted ? RET_SUCCESS : RET_ERROR);
-	if (!exact) {
-		mpool_put(t->bt_mp, e->page, 0);
-		return (deleted ? RET_SUCCESS : RET_SPECIAL);
-	}
-
-	/*
-	 * Delete forward, then delete backward, from the found key.  If
-	 * there are duplicates and we reach either side of the page, do
-	 * the key search again, so that we get them all.
-	 */
-	redo = 0;
-	h = e->page;
-	do {
-		if (__bt_dleaf(t, key, h, e->index)) {
-			mpool_put(t->bt_mp, h, 0);
-			return (RET_ERROR);
-		}
-		if (F_ISSET(t, B_NODUPS)) {
-			if (NEXTINDEX(h) == 0) {
-				if (__bt_pdelete(t, h))
-					return (RET_ERROR);
-			} else
-				mpool_put(t->bt_mp, h, MPOOL_DIRTY);
-			return (RET_SUCCESS);
-		}
-		deleted = 1;
-	} while (e->index < NEXTINDEX(h) && __bt_cmp(t, key, e) == 0);
-
-	/* Check for right-hand edge of the page. */
-	if (e->index == NEXTINDEX(h))
-		redo = 1;
-
-	/* Delete from the key to the beginning of the page. */
-	while (e->index-- > 0) {
-		if (__bt_cmp(t, key, e) != 0)
+		case B_KEYDATA:
+			nbytes = BKEYDATA_SIZE(bk->len);
 			break;
-		if (__bt_dleaf(t, key, h, e->index) == RET_ERROR) {
-			mpool_put(t->bt_mp, h, 0);
-			return (RET_ERROR);
+		default:
+			return (__db_pgfmt(dbp->env, PGNO(h)));
 		}
-		if (e->index == 0)
-			redo = 1;
-	}
-
-	/* Check for an empty page. */
-	if (NEXTINDEX(h) == 0) {
-		if (__bt_pdelete(t, h))
-			return (RET_ERROR);
-		goto loop;
-	}
-
-	/* Put the page. */
-	mpool_put(t->bt_mp, h, MPOOL_DIRTY);
-
-	if (redo)
-		goto loop;
-	return (RET_SUCCESS);
-}
-
-/*
- * __bt_pdelete --
- *	Delete a single page from the tree.
- *
- * Parameters:
- *	t:	tree
- *	h:	leaf page
- *
- * Returns:
- *	RET_SUCCESS, RET_ERROR.
- *
- * Side-effects:
- *	mpool_put's the page
- */
-static int
-__bt_pdelete(t, h)
-	BTREE *t;
-	PAGE *h;
-{
-	BINTERNAL *bi;
-	PAGE *pg;
-	EPGNO *parent;
-	indx_t cnt, index, *ip, offset;
-	u_int32_t nksize;
-	char *from;
-
-	/*
-	 * Walk the parent page stack -- a LIFO stack of the pages that were
-	 * traversed when we searched for the page where the delete occurred.
-	 * Each stack entry is a page number and a page index offset.  The
-	 * offset is for the page traversed on the search.  We've just deleted
-	 * a page, so we have to delete the key from the parent page.
-	 *
-	 * If the delete from the parent page makes it empty, this process may
-	 * continue all the way up the tree.  We stop if we reach the root page
-	 * (which is never deleted, it's just not worth the effort) or if the
-	 * delete does not empty the page.
-	 */
-	while ((parent = BT_POP(t)) != NULL) {
-		/* Get the parent page. */
-		if ((pg = mpool_get(t->bt_mp, parent->pgno, 0)) == NULL)
-			return (RET_ERROR);
-		
-		index = parent->index;
-		bi = GETBINTERNAL(pg, index);
-
-		/* Free any overflow pages. */
-		if (bi->flags & P_BIGKEY &&
-		    __ovfl_delete(t, bi->bytes) == RET_ERROR) {
-			mpool_put(t->bt_mp, pg, 0);
-			return (RET_ERROR);
-		}
-
-		/*
-		 * Free the parent if it has only the one key and it's not the
-		 * root page. If it's the rootpage, turn it back into an empty
-		 * leaf page.
-		 */
-		if (NEXTINDEX(pg) == 1)
-			if (pg->pgno == P_ROOT) {
-				pg->lower = BTDATAOFF;
-				pg->upper = t->bt_psize;
-				pg->flags = P_BLEAF;
-			} else {
-				if (__bt_relink(t, pg) || __bt_free(t, pg))
-					return (RET_ERROR);
-				continue;
-			}
-		else {
-			/* Pack remaining key items at the end of the page. */
-			nksize = NBINTERNAL(bi->ksize);
-			from = (char *)pg + pg->upper;
-			memmove(from + nksize, from, (char *)bi - from);
-			pg->upper += nksize;
-
-			/* Adjust indices' offsets, shift the indices down. */
-			offset = pg->linp[index];
-			for (cnt = index, ip = &pg->linp[0]; cnt--; ++ip)
-				if (ip[0] < offset)
-					ip[0] += nksize;
-			for (cnt = NEXTINDEX(pg) - index; --cnt; ++ip)
-				ip[0] = ip[1] < offset ? ip[1] + nksize : ip[1];
-			pg->lower -= sizeof(indx_t);
-		}
-
-		mpool_put(t->bt_mp, pg, MPOOL_DIRTY);
 		break;
+	default:
+		return (__db_pgfmt(dbp->env, PGNO(h)));
 	}
 
-	/* Free the leaf page, as long as it wasn't the root. */
-	if (h->pgno == P_ROOT) {
-		mpool_put(t->bt_mp, h, MPOOL_DIRTY);
-		return (RET_SUCCESS);
-	}
-	return (__bt_relink(t, h) || __bt_free(t, h));
+	/* Delete the item and mark the page dirty. */
+	if ((ret = __db_ditem(dbc, h, indx, nbytes)) != 0)
+		return (ret);
+
+	return (0);
 }
 
 /*
- * __bt_dleaf --
- *	Delete a single record from a leaf page.
+ * __bam_adjindx --
+ *	Adjust an index on the page.
  *
- * Parameters:
- *	t:	tree
- *    key:	referenced key
- *	h:	page
- *	index:	index on page to delete
- *
- * Returns:
- *	RET_SUCCESS, RET_ERROR.
+ * PUBLIC: int __bam_adjindx __P((DBC *, PAGE *, u_int32_t, u_int32_t, int));
  */
 int
-__bt_dleaf(t, key, h, index)
-	BTREE *t;
-	const DBT *key;
+__bam_adjindx(dbc, h, indx, indx_copy, is_insert)
+	DBC *dbc;
 	PAGE *h;
-	u_int index;
+	u_int32_t indx, indx_copy;
+	int is_insert;
 {
-	BLEAF *bl;
-	indx_t cnt, *ip, offset;
-	u_int32_t nbytes;
-	void *to;
-	char *from;
+	DB *dbp;
+	db_indx_t copy, *inp;
+	int ret;
 
-	/* If this record is referenced by the cursor, delete the cursor. */
-	if (F_ISSET(&t->bt_cursor, CURS_INIT) &&
-	    !F_ISSET(&t->bt_cursor, CURS_ACQUIRE) &&
-	    t->bt_cursor.pg.pgno == h->pgno && t->bt_cursor.pg.index == index &&
-	    __bt_curdel(t, key, h, index))
-		return (RET_ERROR);
+	dbp = dbc->dbp;
+	inp = P_INP(dbp, h);
 
-	/* If the entry uses overflow pages, make them available for reuse. */
-	to = bl = GETBLEAF(h, index);
-	if (bl->flags & P_BIGKEY && __ovfl_delete(t, bl->bytes) == RET_ERROR)
-		return (RET_ERROR);
-	if (bl->flags & P_BIGDATA &&
-	    __ovfl_delete(t, bl->bytes + bl->ksize) == RET_ERROR)
-		return (RET_ERROR);
+	/* Log the change. */
+	if (DBC_LOGGING(dbc)) {
+	    if ((ret = __bam_adj_log(dbp, dbc->txn, &LSN(h), 0,
+		PGNO(h), &LSN(h), indx, indx_copy, (u_int32_t)is_insert)) != 0)
+			return (ret);
+	} else
+		LSN_NOT_LOGGED(LSN(h));
 
-	/* Pack the remaining key/data items at the end of the page. */
-	nbytes = NBLEAF(bl);
-	from = (char *)h + h->upper;
-	memmove(from + nbytes, from, (char *)to - from);
-	h->upper += nbytes;
+	/* Shuffle the indices and mark the page dirty. */
+	if (is_insert) {
+		copy = inp[indx_copy];
+		if (indx != NUM_ENT(h))
+			memmove(&inp[indx + O_INDX], &inp[indx],
+			    sizeof(db_indx_t) * (NUM_ENT(h) - indx));
+		inp[indx] = copy;
+		++NUM_ENT(h);
+	} else {
+		--NUM_ENT(h);
+		if (indx != NUM_ENT(h))
+			memmove(&inp[indx], &inp[indx + O_INDX],
+			    sizeof(db_indx_t) * (NUM_ENT(h) - indx));
+	}
 
-	/* Adjust the indices' offsets, shift the indices down. */
-	offset = h->linp[index];
-	for (cnt = index, ip = &h->linp[0]; cnt--; ++ip)
-		if (ip[0] < offset)
-			ip[0] += nbytes;
-	for (cnt = NEXTINDEX(h) - index; --cnt; ++ip)
-		ip[0] = ip[1] < offset ? ip[1] + nbytes : ip[1];
-	h->lower -= sizeof(indx_t);
-
-	/* If the cursor is on this page, adjust it as necessary. */
-	if (F_ISSET(&t->bt_cursor, CURS_INIT) &&
-	    !F_ISSET(&t->bt_cursor, CURS_ACQUIRE) &&
-	    t->bt_cursor.pg.pgno == h->pgno && t->bt_cursor.pg.index > index)
-		--t->bt_cursor.pg.index;
-
-	return (RET_SUCCESS);
+	return (0);
 }
 
 /*
- * __bt_curdel --
- *	Delete the cursor.
+ * __bam_dpages --
+ *	Delete a set of locked pages.
  *
- * Parameters:
- *	t:	tree
- *    key:	referenced key (or NULL)
- *	h:	page
- *  index:	index on page to delete
- *
- * Returns:
- *	RET_SUCCESS, RET_ERROR.
+ * PUBLIC: int __bam_dpages __P((DBC *, int, int));
  */
-static int
-__bt_curdel(t, key, h, index)
-	BTREE *t;
-	const DBT *key;
-	PAGE *h;
-	u_int index;
+int
+__bam_dpages(dbc, use_top, flags)
+	DBC *dbc;
+	int use_top;
+	int flags;
 {
-	CURSOR *c;
-	EPG e;
-	PAGE *pg;
-	int curcopy, status;
+	BINTERNAL *bi;
+	BTREE_CURSOR *cp;
+	DB *dbp;
+	DBT a, b;
+	DB_LOCK c_lock, p_lock;
+	DB_MPOOLFILE *mpf;
+	EPG *epg, *save_sp, *stack_epg;
+	PAGE *child, *parent;
+	db_indx_t nitems;
+	db_pgno_t pgno, root_pgno;
+	db_recno_t rcnt;
+	int done, ret, t_ret;
+
+	dbp = dbc->dbp;
+	mpf = dbp->mpf;
+	cp = (BTREE_CURSOR *)dbc->internal;
+	nitems = 0;
+	pgno = PGNO_INVALID;
 
 	/*
-	 * If there are duplicates, move forward or backward to one.
-	 * Otherwise, copy the key into the cursor area.
+	 * We have the entire stack of deletable pages locked.
+	 *
+	 * Btree calls us with the first page in the stack is to have a
+	 * single item deleted, and the rest of the pages are to be removed.
+	 *
+	 * Recno always has a stack to the root and __bam_merge operations
+	 * may have unneeded items in the sack.  We find the lowest page
+	 * in the stack that has more than one record in it and start there.
 	 */
-	c = &t->bt_cursor;
-	F_CLR(c, CURS_AFTER | CURS_BEFORE | CURS_ACQUIRE);
+	ret = 0;
+	if (use_top)
+		stack_epg = cp->sp;
+	else
+		for (stack_epg = cp->csp; stack_epg > cp->sp; --stack_epg)
+			if (NUM_ENT(stack_epg->page) > 1)
+				break;
+	epg = stack_epg;
+	/*
+	 * !!!
+	 * There is an interesting deadlock situation here.  We have to relink
+	 * the leaf page chain around the leaf page being deleted.  Consider
+	 * a cursor walking through the leaf pages, that has the previous page
+	 * read-locked and is waiting on a lock for the page we're deleting.
+	 * It will deadlock here.  Before we unlink the subtree, we relink the
+	 * leaf page chain.
+	 */
+	if (LF_ISSET(BTD_RELINK) && LEVEL(cp->csp->page) == 1 &&
+	    (ret = __bam_relink(dbc, cp->csp->page, NULL, PGNO_INVALID)) != 0)
+		goto discard;
 
-	curcopy = 0;
-	if (!F_ISSET(t, B_NODUPS)) {
+	/*
+	 * Delete the last item that references the underlying pages that are
+	 * to be deleted, and adjust cursors that reference that page.  Then,
+	 * save that page's page number and item count and release it.  If
+	 * the application isn't retaining locks because it's running without
+	 * transactions, this lets the rest of the tree get back to business
+	 * immediately.
+	 */
+	if ((ret = __memp_dirty(mpf,
+	    &epg->page, dbc->thread_info, dbc->txn, dbc->priority, 0)) != 0)
+		goto discard;
+	if ((ret = __bam_ditem(dbc, epg->page, epg->indx)) != 0)
+		goto discard;
+	if ((ret = __bam_ca_di(dbc, PGNO(epg->page), epg->indx, -1)) != 0)
+		goto discard;
+
+	if (LF_ISSET(BTD_UPDATE) && epg->indx == 0) {
+		save_sp = cp->csp;
+		cp->csp = epg;
+		ret = __bam_pupdate(dbc, epg->page);
+		cp->csp = save_sp;
+		if (ret != 0)
+			goto discard;
+	}
+
+	pgno = PGNO(epg->page);
+	nitems = NUM_ENT(epg->page);
+
+	ret = __memp_fput(mpf, dbc->thread_info, epg->page, dbc->priority);
+	epg->page = NULL;
+	if ((t_ret = __TLPUT(dbc, epg->lock)) != 0 && ret == 0)
+		ret = t_ret;
+	if (ret != 0)
+		goto err_inc;
+
+	/* Then, discard any pages that we don't care about. */
+discard: for (epg = cp->sp; epg < stack_epg; ++epg) {
+		if ((t_ret = __memp_fput(mpf, dbc->thread_info,
+		     epg->page, dbc->priority)) != 0 && ret == 0)
+			ret = t_ret;
+		epg->page = NULL;
+		if ((t_ret = __TLPUT(dbc, epg->lock)) != 0 && ret == 0)
+			ret = t_ret;
+	}
+	if (ret != 0)
+		goto err;
+
+	/* Free the rest of the pages in the stack. */
+	while (++epg <= cp->csp) {
+		if ((ret = __memp_dirty(mpf, &epg->page,
+		    dbc->thread_info, dbc->txn, dbc->priority, 0)) != 0)
+			goto err;
 		/*
-		 * We're going to have to do comparisons.  If we weren't
-		 * provided a copy of the key, i.e. the user is deleting
-		 * the current cursor position, get one.
+		 * Delete page entries so they will be restored as part of
+		 * recovery.  We don't need to do cursor adjustment here as
+		 * the pages are being emptied by definition and so cannot
+		 * be referenced by a cursor.
 		 */
-		if (key == NULL) {
-			e.page = h;
-			e.index = index;
-			if ((status = __bt_ret(t, &e,
-			    &c->key, &c->key, NULL, NULL, 1)) != RET_SUCCESS)
-				return (status);
-			curcopy = 1;
-			key = &c->key;
+		if (NUM_ENT(epg->page) != 0) {
+			DB_ASSERT(dbp->env, LEVEL(epg->page) != 1);
+
+			if ((ret = __bam_ditem(dbc, epg->page, epg->indx)) != 0)
+				goto err;
+			/*
+			 * Sheer paranoia: if we find any pages that aren't
+			 * emptied by the delete, someone else added an item
+			 * while we were walking the tree, and we discontinue
+			 * the delete.  Shouldn't be possible, but we check
+			 * regardless.
+			 */
+			if (NUM_ENT(epg->page) != 0)
+				goto err;
 		}
-		/* Check previous key, if not at the beginning of the page. */
-		if (index > 0) { 
-			e.page = h;
-			e.index = index - 1;
-			if (__bt_cmp(t, key, &e) == 0) {
-				F_SET(c, CURS_BEFORE);
-				goto dup2;
-			}
-		}
-		/* Check next key, if not at the end of the page. */
-		if (index < NEXTINDEX(h) - 1) {
-			e.page = h;
-			e.index = index + 1;
-			if (__bt_cmp(t, key, &e) == 0) {
-				F_SET(c, CURS_AFTER);
-				goto dup2;
-			}
-		}
-		/* Check previous key if at the beginning of the page. */
-		if (index == 0 && h->prevpg != P_INVALID) {
-			if ((pg = mpool_get(t->bt_mp, h->prevpg, 0)) == NULL)
-				return (RET_ERROR);
-			e.page = pg;
-			e.index = NEXTINDEX(pg) - 1;
-			if (__bt_cmp(t, key, &e) == 0) {
-				F_SET(c, CURS_BEFORE);
-				goto dup1;
-			}
-			mpool_put(t->bt_mp, pg, 0);
-		}
-		/* Check next key if at the end of the page. */
-		if (index == NEXTINDEX(h) - 1 && h->nextpg != P_INVALID) {
-			if ((pg = mpool_get(t->bt_mp, h->nextpg, 0)) == NULL)
-				return (RET_ERROR);
-			e.page = pg;
-			e.index = 0;
-			if (__bt_cmp(t, key, &e) == 0) {
-				F_SET(c, CURS_AFTER);
-dup1:				mpool_put(t->bt_mp, pg, 0);
-dup2:				c->pg.pgno = e.page->pgno;
-				c->pg.index = e.index;
-				return (RET_SUCCESS);
-			}
-			mpool_put(t->bt_mp, pg, 0);
-		}
+
+		ret = __db_free(dbc, epg->page);
+		if (cp->page == epg->page)
+			cp->page = NULL;
+		epg->page = NULL;
+		if ((t_ret = __TLPUT(dbc, epg->lock)) != 0 && ret == 0)
+			ret = t_ret;
+		if (ret != 0)
+			goto err_inc;
 	}
-	e.page = h;
-	e.index = index;
-	if (curcopy || (status =
-	    __bt_ret(t, &e, &c->key, &c->key, NULL, NULL, 1)) == RET_SUCCESS) {
-		F_SET(c, CURS_ACQUIRE);
-		return (RET_SUCCESS);
+
+	if (0) {
+err_inc:	++epg;
+err:		for (; epg <= cp->csp; ++epg) {
+			if (epg->page != NULL) {
+				(void)__memp_fput(mpf, dbc->thread_info,
+				     epg->page, dbc->priority);
+				epg->page = NULL;
+			}
+			(void)__TLPUT(dbc, epg->lock);
+		}
+		BT_STK_CLR(cp);
+		return (ret);
 	}
-	return (status);
+	BT_STK_CLR(cp);
+
+	/*
+	 * If we just deleted the next-to-last item from the root page, the
+	 * tree can collapse one or more levels.  While there remains only a
+	 * single item on the root page, write lock the last page referenced
+	 * by the root page and copy it over the root page.
+	 */
+	root_pgno = cp->root;
+	if (pgno != root_pgno || nitems != 1)
+		return (0);
+
+	for (done = 0; !done;) {
+		/* Initialize. */
+		parent = child = NULL;
+		LOCK_INIT(p_lock);
+		LOCK_INIT(c_lock);
+
+		/* Lock the root. */
+		pgno = root_pgno;
+		if ((ret =
+		    __db_lget(dbc, 0, pgno, DB_LOCK_WRITE, 0, &p_lock)) != 0)
+			goto stop;
+		if ((ret = __memp_fget(mpf, &pgno, dbc->thread_info, dbc->txn,
+		    DB_MPOOL_DIRTY, &parent)) != 0)
+			goto stop;
+
+		if (NUM_ENT(parent) != 1)
+			goto stop;
+
+		switch (TYPE(parent)) {
+		case P_IBTREE:
+			/*
+			 * If this is overflow, then try to delete it.
+			 * The child may or may not still point at it.
+			 */
+			bi = GET_BINTERNAL(dbp, parent, 0);
+			if (B_TYPE(bi->type) == B_OVERFLOW)
+				if ((ret = __db_doff(dbc,
+				    ((BOVERFLOW *)bi->data)->pgno)) != 0)
+					goto stop;
+			pgno = bi->pgno;
+			break;
+		case P_IRECNO:
+			pgno = GET_RINTERNAL(dbp, parent, 0)->pgno;
+			break;
+		default:
+			goto stop;
+		}
+
+		/* Lock the child page. */
+		if ((ret =
+		    __db_lget(dbc, 0, pgno, DB_LOCK_WRITE, 0, &c_lock)) != 0)
+			goto stop;
+		if ((ret = __memp_fget(mpf, &pgno, dbc->thread_info, dbc->txn,
+		    DB_MPOOL_DIRTY, &child)) != 0)
+			goto stop;
+
+		/* Log the change. */
+		if (DBC_LOGGING(dbc)) {
+			memset(&a, 0, sizeof(a));
+			a.data = child;
+			a.size = dbp->pgsize;
+			memset(&b, 0, sizeof(b));
+			b.data = P_ENTRY(dbp, parent, 0);
+			b.size = TYPE(parent) == P_IRECNO ? RINTERNAL_SIZE :
+			    BINTERNAL_SIZE(((BINTERNAL *)b.data)->len);
+			if ((ret = __bam_rsplit_log(dbp, dbc->txn,
+			    &child->lsn, 0, PGNO(child), &a, PGNO(parent),
+			    RE_NREC(parent), &b, &parent->lsn)) != 0)
+				goto stop;
+		} else
+			LSN_NOT_LOGGED(child->lsn);
+
+		/*
+		 * Make the switch.
+		 *
+		 * One fixup -- internal pages below the top level do not store
+		 * a record count, so we have to preserve it if we're not
+		 * converting to a leaf page.  Note also that we are about to
+		 * overwrite the parent page, including its LSN.  This is OK
+		 * because the log message we wrote describing this update
+		 * stores its LSN on the child page.  When the child is copied
+		 * onto the parent, the correct LSN is copied into place.
+		 */
+		COMPQUIET(rcnt, 0);
+		if (F_ISSET(cp, C_RECNUM) && LEVEL(child) > LEAFLEVEL)
+			rcnt = RE_NREC(parent);
+		memcpy(parent, child, dbp->pgsize);
+		PGNO(parent) = root_pgno;
+		if (F_ISSET(cp, C_RECNUM) && LEVEL(child) > LEAFLEVEL)
+			RE_NREC_SET(parent, rcnt);
+
+		/* Adjust the cursors. */
+		if ((ret = __bam_ca_rsplit(dbc, PGNO(child), root_pgno)) != 0)
+			goto stop;
+
+		/*
+		 * Free the page copied onto the root page and discard its
+		 * lock.  (The call to __db_free() discards our reference
+		 * to the page.)
+		 */
+		if ((ret = __db_free(dbc, child)) != 0) {
+			child = NULL;
+			goto stop;
+		}
+		child = NULL;
+
+		if (0) {
+stop:			done = 1;
+		}
+		if ((t_ret = __TLPUT(dbc, p_lock)) != 0 && ret == 0)
+			ret = t_ret;
+		if (parent != NULL &&
+		    (t_ret = __memp_fput(mpf, dbc->thread_info,
+		    parent, dbc->priority)) != 0 && ret == 0)
+			ret = t_ret;
+		if ((t_ret = __TLPUT(dbc, c_lock)) != 0 && ret == 0)
+			ret = t_ret;
+		if (child != NULL &&
+		    (t_ret = __memp_fput(mpf, dbc->thread_info,
+		    child, dbc->priority)) != 0 && ret == 0)
+			ret = t_ret;
+	}
+
+	return (ret);
 }
 
 /*
- * __bt_relink --
- *	Link around a deleted page.
+ * __bam_relink --
+ *	Relink around a deleted page.
  *
- * Parameters:
- *	t:	tree
- *	h:	page to be deleted
+ * PUBLIC: int __bam_relink __P((DBC *, PAGE *, PAGE *, db_pgno_t));
+ *	Otherp can be either the previous or the next page to use if
+ * the caller already holds that page.
  */
-static int
-__bt_relink(t, h)
-	BTREE *t;
-	PAGE *h;
+int
+__bam_relink(dbc, pagep, otherp, new_pgno)
+	DBC *dbc;
+	PAGE *pagep, *otherp;
+	db_pgno_t new_pgno;
 {
-	PAGE *pg;
+	DB *dbp;
+	DB_LOCK npl, ppl;
+	DB_LSN *nlsnp, *plsnp, ret_lsn;
+	DB_MPOOLFILE *mpf;
+	PAGE *np, *pp;
+	int ret, t_ret;
 
-	if (h->nextpg != P_INVALID) {
-		if ((pg = mpool_get(t->bt_mp, h->nextpg, 0)) == NULL)
-			return (RET_ERROR);
-		pg->prevpg = h->prevpg;
-		mpool_put(t->bt_mp, pg, MPOOL_DIRTY);
+	dbp = dbc->dbp;
+	np = pp = NULL;
+	LOCK_INIT(npl);
+	LOCK_INIT(ppl);
+	nlsnp = plsnp = NULL;
+	mpf = dbp->mpf;
+	ret = 0;
+
+	/*
+	 * Retrieve the one/two pages.  The caller must have them locked
+	 * because the parent is latched. For a remove, we may need
+	 * two pages (the before and after).  For an add, we only need one
+	 * because, the split took care of the prev.
+	 */
+	if (pagep->next_pgno != PGNO_INVALID) {
+		if (((np = otherp) == NULL ||
+		    PGNO(otherp) != pagep->next_pgno) &&
+		    (ret = __memp_fget(mpf, &pagep->next_pgno,
+		    dbc->thread_info, dbc->txn, DB_MPOOL_DIRTY, &np)) != 0) {
+			ret = __db_pgerr(dbp, pagep->next_pgno, ret);
+			goto err;
+		}
+		nlsnp = &np->lsn;
 	}
-	if (h->prevpg != P_INVALID) {
-		if ((pg = mpool_get(t->bt_mp, h->prevpg, 0)) == NULL)
-			return (RET_ERROR);
-		pg->nextpg = h->nextpg;
-		mpool_put(t->bt_mp, pg, MPOOL_DIRTY);
+	if (pagep->prev_pgno != PGNO_INVALID) {
+		if (((pp = otherp) == NULL ||
+		    PGNO(otherp) != pagep->prev_pgno) &&
+		    (ret = __memp_fget(mpf, &pagep->prev_pgno,
+		    dbc->thread_info, dbc->txn, DB_MPOOL_DIRTY, &pp)) != 0) {
+			ret = __db_pgerr(dbp, pagep->prev_pgno, ret);
+			goto err;
+		}
+		plsnp = &pp->lsn;
+	}
+
+	/* Log the change. */
+	if (DBC_LOGGING(dbc)) {
+		if ((ret = __bam_relink_log(dbp, dbc->txn, &ret_lsn, 0,
+		    pagep->pgno, new_pgno, pagep->prev_pgno, plsnp,
+		    pagep->next_pgno, nlsnp)) != 0)
+			goto err;
+	} else
+		LSN_NOT_LOGGED(ret_lsn);
+	if (np != NULL)
+		np->lsn = ret_lsn;
+	if (pp != NULL)
+		pp->lsn = ret_lsn;
+
+	/*
+	 * Modify and release the two pages.
+	 */
+	if (np != NULL) {
+		if (new_pgno == PGNO_INVALID)
+			np->prev_pgno = pagep->prev_pgno;
+		else
+			np->prev_pgno = new_pgno;
+		if (np != otherp)
+			ret = __memp_fput(mpf,
+			    dbc->thread_info, np, dbc->priority);
+		if ((t_ret = __TLPUT(dbc, npl)) != 0 && ret == 0)
+			ret = t_ret;
+		if (ret != 0)
+			goto err;
+	}
+
+	if (pp != NULL) {
+		if (new_pgno == PGNO_INVALID)
+			pp->next_pgno = pagep->next_pgno;
+		else
+			pp->next_pgno = new_pgno;
+		if (pp != otherp)
+			ret = __memp_fput(mpf,
+			    dbc->thread_info, pp, dbc->priority);
+		if ((t_ret = __TLPUT(dbc, ppl)) != 0 && ret == 0)
+			ret = t_ret;
+		if (ret != 0)
+			goto err;
 	}
 	return (0);
+
+err:	if (np != NULL && np != otherp)
+		(void)__memp_fput(mpf, dbc->thread_info, np, dbc->priority);
+	if (pp != NULL && pp != otherp)
+		(void)__memp_fput(mpf, dbc->thread_info, pp, dbc->priority);
+	return (ret);
+}
+
+/*
+ * __bam_pupdate --
+ *	Update parent key pointers up the tree.
+ *
+ * PUBLIC: int __bam_pupdate __P((DBC *, PAGE *));
+ */
+int
+__bam_pupdate(dbc, lpg)
+	DBC *dbc;
+	PAGE *lpg;
+{
+	BTREE_CURSOR *cp;
+	ENV *env;
+	EPG *epg;
+	int ret;
+
+	env = dbc->env;
+	cp = (BTREE_CURSOR *)dbc->internal;
+	ret = 0;
+
+	/*
+	 * Update the parents up the tree.  __bam_pinsert only looks at the
+	 * left child if is a leaf page, so we don't need to change it.  We
+	 * just do a delete and insert; a replace is possible but reusing
+	 * pinsert is better.
+	 */
+	for (epg = &cp->csp[-1]; epg >= cp->sp; epg--) {
+		if ((ret = __memp_dirty(dbc->dbp->mpf, &epg->page,
+		    dbc->thread_info, dbc->txn, dbc->priority, 0)) != 0)
+			return (ret);
+		epg->indx--;
+		if ((ret = __bam_pinsert(dbc, epg, 0,
+		    lpg, epg[1].page, BPI_NORECNUM | BPI_REPLACE)) != 0) {
+			if (ret == DB_NEEDSPLIT) {
+				/* This should not happen. */
+				__db_errx(env,
+				     "Not enough room in parent: %s: page %lu",
+				     dbc->dbp->fname, (u_long)PGNO(epg->page));
+				ret = __env_panic(env, EINVAL);
+			}
+			epg->indx++;
+			return (ret);
+		}
+		epg->indx++;
+	}
+	return (ret);
 }
