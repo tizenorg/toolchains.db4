@@ -280,6 +280,9 @@ chmod u+w ${RPM_BUILD_ROOT}%{_bindir} ${RPM_BUILD_ROOT}%{_bindir}/*
 # remove unneeded .la files (#225675)
 rm -f ${RPM_BUILD_ROOT}%{_libdir}/*.la
 
+mkdir -p %{buildroot}/usr/share/license
+cp LICENSE %{buildroot}/usr/share/license/%{name}
+
 %clean
 rm -rf ${RPM_BUILD_ROOT}
 
@@ -300,6 +303,7 @@ rm -rf ${RPM_BUILD_ROOT}
 %doc LICENSE README
 /%{_lib}/libdb-%{__soversion}.so
 %{_libdir}/libdb-%{__soversion}.so
+/usr/share/license/%{name}
 
 %files cxx
 %defattr(-,root,root)
