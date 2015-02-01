@@ -173,7 +173,7 @@ cd dist
 CFLAGS="$RPM_OPT_FLAGS -fno-strict-aliasing"; export CFLAGS
 
 # Build the old db-185 libraries.
-make -C db.1.85/PORT/%{_os} OORG="$CFLAGS"
+make %{?_smp_mflags} -C db.1.85/PORT/%{_os} OORG="$CFLAGS"
 
 build() {
 	test -d dist/$1 || mkdir dist/$1
