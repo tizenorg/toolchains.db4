@@ -11,7 +11,7 @@ Summary: The Berkeley DB database library (version 4) for C
 Name: db4
 Version: 4.8.30
 Release: 1
-Source0: http://download.oracle.com/berkeley-db/%{name}-%{version}.tar.bz2
+Source0: http://download.oracle.com/berkeley-db/db-%{version}.tar.gz
 Source1: http://download.oracle.com/berkeley-db/db.1.85.tar.gz
 # db-1.85 upstream patches
 Patch10: http://www.oracle.com/technology/products/berkeley-db/db/update/1.85/patch.1.1
@@ -114,7 +114,7 @@ client/server applications. This package contains the libraries
 for building programs which use the Berkeley DB in Java.
 
 %prep
-%setup -q -n %{name}-%{version} -a 1
+%setup -q -n db-%{version} -a 1
 
 pushd db.1.85/PORT/linux
 %patch10 -p0 -b .1.1
@@ -173,7 +173,7 @@ cd dist
 CFLAGS="$RPM_OPT_FLAGS -fno-strict-aliasing"; export CFLAGS
 
 # Build the old db-185 libraries.
-make -C db.1.85/PORT/%{_os} OORG="$CFLAGS"
+make %{?_smp_mflags} -C db.1.85/PORT/%{_os} OORG="$CFLAGS"
 
 build() {
 	test -d dist/$1 || mkdir dist/$1
@@ -280,6 +280,9 @@ chmod u+w ${RPM_BUILD_ROOT}%{_bindir} ${RPM_BUILD_ROOT}%{_bindir}/*
 # remove unneeded .la files (#225675)
 rm -f ${RPM_BUILD_ROOT}%{_libdir}/*.la
 
+mkdir -p %{buildroot}/usr/share/license
+cp -f LICENSE %{buildroot}/usr/share/license/%{name}
+
 %clean
 rm -rf ${RPM_BUILD_ROOT}
 
@@ -300,6 +303,7 @@ rm -rf ${RPM_BUILD_ROOT}
 %doc LICENSE README
 /%{_lib}/libdb-%{__soversion}.so
 %{_libdir}/libdb-%{__soversion}.so
+/usr/share/license/%{name}
 
 %files cxx
 %defattr(-,root,root)
