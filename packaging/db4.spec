@@ -23,7 +23,7 @@ Patch20: db-1.85-errno.patch
 Patch22: db-4.6.21-1.85-compat.patch
 Patch24: db-4.5.20-jni-include-dir.patch
 URL: http://www.oracle.com/database/berkeley-db/
-License: BSD
+License: BSD-2.0
 Group: System/Libraries
 # unversioned obsoletes are OK here as these BDB versions never occur again
 Obsoletes: db1, db2, db3
